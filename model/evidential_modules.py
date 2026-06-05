@@ -27,6 +27,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+_NUMERICAL_EPS = 1e-6
+
+
+def _safe_normalize(tensor: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Normalize along ``dim`` with a small epsilon to avoid NaNs from zero sums."""
+    denom = tensor.sum(dim=dim, keepdim=True).clamp_min(_NUMERICAL_EPS)
+    return tensor / denom
+
 
 class Distance_layer(nn.Module):
     """Squared Euclidean distance from each input to ``n_prototypes`` prototypes."""
@@ -46,7 +54,9 @@ class Distance_layer(nn.Module):
 class DistanceActivation_layer(nn.Module):
     """Turn distances into per-prototype activations in ``[0, 1]``."""
 
-    def __init__(self, n_prototypes: int, init_alpha: float = 0.0, init_gamma: float = 0.1) -> None:
+    def __init__(
+        self, n_prototypes: int, init_alpha: float = 0.0, init_gamma: float = 0.1
+    ) -> None:
         super().__init__()
         self.eta = nn.Linear(in_features=n_prototypes, out_features=1, bias=False)
         self.xi = nn.Linear(in_features=n_prototypes, out_features=1, bias=False)
@@ -77,8 +87,8 @@ class Belief_layer(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         beta = torch.square(self.beta)
-        beta_sum = torch.sum(beta, dim=0, keepdim=True)
-        u = torch.div(beta, beta_sum)
+        beta_sum = torch.sum(beta, dim=0, keepdim=True).clamp_min(_NUMERICAL_EPS)
+        u = beta / beta_sum
         mass_prototype = torch.einsum("cp,b...p->b...pc", u, inputs)
         return mass_prototype
 
@@ -115,7 +125,7 @@ class Dempster_layer(nn.Module):
             combine3 = torch.mul(omega1, m2)
             combine1_2 = combine1 + combine2
             combine2_3 = combine1_2 + combine3
-            combine2_3 = combine2_3 / torch.sum(combine2_3, dim=-1, keepdim=True)
+            combine2_3 = _safe_normalize(combine2_3, dim=-1)
             m1 = combine2_3
             omega1 = torch.unsqueeze(combine2_3[..., -1], -1)
         return m1
@@ -125,7 +135,7 @@ class DempsterNormalize_layer(nn.Module):
     """Normalise a combined mass function so it sums to one."""
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        return inputs / torch.sum(inputs, dim=-1, keepdim=True)
+        return _safe_normalize(inputs, dim=-1)
 
 
 class Dempster_Shafer_module(nn.Module):
@@ -136,11 +146,15 @@ class Dempster_Shafer_module(nn.Module):
         self.n_prototypes = n_prototypes
         self.n_classes = n_classes
         self.n_feature_maps = n_feature_maps
-        self.ds1 = Distance_layer(n_prototypes=n_prototypes, n_feature_maps=n_feature_maps)
+        self.ds1 = Distance_layer(
+            n_prototypes=n_prototypes, n_feature_maps=n_feature_maps
+        )
         self.ds1_activate = DistanceActivation_layer(n_prototypes=n_prototypes)
         self.ds2 = Belief_layer(n_prototypes=n_prototypes, num_class=n_classes)
         self.ds2_omega = Omega_layer(n_prototypes=n_prototypes, num_class=n_classes)
-        self.ds3_dempster = Dempster_layer(n_prototypes=n_prototypes, num_class=n_classes)
+        self.ds3_dempster = Dempster_layer(
+            n_prototypes=n_prototypes, num_class=n_classes
+        )
         self.ds3_normalize = DempsterNormalize_layer()
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
@@ -171,7 +185,9 @@ class DM(nn.Module):
     the retained ``nu * omega`` ignorance term.
     """
 
-    def __init__(self, num_class: int, nu: float = 0.9, device: torch.device | None = None) -> None:
+    def __init__(
+        self, num_class: int, nu: float = 0.9, device: torch.device | None = None
+    ) -> None:
         super().__init__()
         self.nu = nu
         self.num_class = num_class
@@ -187,18 +203,19 @@ class DM(nn.Module):
 class EvidentialLoss(nn.Module):
     """BCE-style evidential loss on expected utilities with a KL warm-up gate."""
 
-    def __init__(self, num_classes: int, kl_warmup_epochs: int = 35, lmda: float = 10.0) -> None:
+    def __init__(
+        self, num_classes: int, kl_warmup_epochs: int = 35, lmda: float = 10.0
+    ) -> None:
         super().__init__()
         self.num_classes = num_classes
         self.lmda = lmda
         self.kl_warmup_epochs = kl_warmup_epochs
 
     def forward(self, E_preds, targets, beliefs=None, epoch=None):
-        E = E_preds.clamp(1e-6, 1 - 1e-6)
+        E = E_preds.float().clamp(_NUMERICAL_EPS, 1.0 - _NUMERICAL_EPS)
         yk = F.one_hot(targets, num_classes=self.num_classes).float().to(E.device)
 
-        log_probs = yk * torch.log(E) + (1 - yk) * torch.log(1 - E)
-        base = -torch.sum(log_probs, dim=1)
+        base = F.binary_cross_entropy(E, yk, reduction="none").sum(dim=1)
 
         U = E
         p = U / (U.sum(dim=1, keepdim=True) + 1e-8)

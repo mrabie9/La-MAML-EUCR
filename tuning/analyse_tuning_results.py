@@ -137,6 +137,77 @@ def is_finite_number(value: Any) -> bool:
     )
 
 
+def _reconstruct_hierarchical_params(
+    summary: Dict[str, Any], param_names: Sequence[str]
+) -> Dict[str, Any]:
+    """Rebuild final hierarchical hyperparameters from per-stage trial winners."""
+    search_space = summary.get("search_space")
+    if not isinstance(search_space, dict):
+        return {}
+
+    stage_winners: Dict[str, Dict[str, Any]] = {}
+    for result in summary.get("results", []):
+        if result.get("status") != "ok":
+            continue
+        stage = result.get("stage")
+        if stage not in search_space:
+            continue
+        current = stage_winners.get(stage)
+        score = result.get("score")
+        if not is_finite_number(score):
+            continue
+        if current is None or float(score) > float(current.get("score", float("-inf"))):
+            stage_winners[stage] = result
+
+    combined: Dict[str, Any] = {}
+    for stage in search_space:
+        winner = stage_winners.get(stage)
+        if winner is None:
+            continue
+        value = (winner.get("trial_params") or {}).get(stage)
+        if value is None:
+            value = (winner.get("params") or {}).get(stage)
+        if value is not None:
+            combined[stage] = value
+    if not combined:
+        return {}
+    return {name: combined.get(name) for name in param_names}
+
+
+def resolve_best_display_params(
+    summary: Dict[str, Any], best: Dict[str, Any], param_names: Sequence[str]
+) -> Dict[str, Any]:
+    """Return the hyperparameters that should be shown for the best trial.
+
+    Hierarchical sweeps store per-stage ``params`` on each trial, so the global
+    ``best`` entry may only contain the parameter tuned in that stage. Prefer
+    ``hierarchical_final_params`` when present, otherwise merge fixed and trial
+    overrides into the reported ``params`` mapping.
+
+    Args:
+        summary: Parsed tuning summary JSON.
+        best: Best-trial record from the summary.
+        param_names: Hyperparameter names to include in the output mapping.
+
+    Returns:
+        Mapping from hyperparameter name to value for display/writeback hints.
+    """
+    hierarchical_params = summary.get("hierarchical_final_params")
+    if isinstance(hierarchical_params, dict) and hierarchical_params:
+        return {name: hierarchical_params.get(name) for name in param_names}
+
+    if summary.get("hierarchical") and param_names:
+        reconstructed = _reconstruct_hierarchical_params(summary, param_names)
+        if reconstructed:
+            return reconstructed
+
+    merged: Dict[str, Any] = {}
+    merged.update(best.get("fixed_params") or {})
+    merged.update(best.get("trial_params") or {})
+    merged.update(best.get("params") or {})
+    return {name: merged.get(name) for name in param_names}
+
+
 def infer_param_names(
     summary: Dict[str, Any], rows: Sequence[Dict[str, Any]]
 ) -> List[str]:
@@ -170,8 +241,13 @@ def print_header(
     print(f"Trials completed : {len(rows)} / {summary.get('num_trials')}\n")
 
     best = summary.get("best") or {}
-    best_params = best.get("params") or {}
+    best_params = resolve_best_display_params(summary, best, param_names)
     print("Best trial (from summary)")
+    if summary.get("hierarchical") and best.get("stage") != list(param_names)[-1]:
+        print(
+            "  note: hierarchical sweep; displayed params are the final combined "
+            f"values (best trial #{best.get('trial')} is from stage '{best.get('stage')}')."
+        )
     best_score = best.get("score")
     if is_finite_number(best_score):
         print(
@@ -203,11 +279,13 @@ def print_top_trials(
     param_names: Sequence[str],
     metric_key: str,
 ) -> None:
-    def sort_key(item: Dict[str, Any]) -> float:
+    def sort_key(item: Dict[str, Any]) -> tuple[float, int, int]:
         value = item.get(metric_key)
-        if is_finite_number(value):
-            return float(value)
-        return float("-inf")
+        score_value = float(value) if is_finite_number(value) else float("-inf")
+        params = item.get("params") or {}
+        trial_index = item.get("trial")
+        trial_number = int(trial_index) if isinstance(trial_index, int) else -1
+        return (score_value, len(params), trial_number)
 
     valid_rows = sorted(rows, key=sort_key, reverse=True)
     print(f"\nTop trials by {metric_key}")

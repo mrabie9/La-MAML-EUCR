@@ -1,6 +1,8 @@
 *.out
 *.pyc
 */__pycache__
+.ruff_cache/
+.pytest_cache/
 *.pt
 data/
 *.tar.gz
@@ -20,3 +22,5 @@ icarl3.txt
 icarl4.txtplots/
 *.png
 *.pdf
+analysis/
+data

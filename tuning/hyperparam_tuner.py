@@ -30,17 +30,42 @@ TypeHints = Dict[str, type]
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
+def _dedupe_config_sources(sources: Sequence[str]) -> List[str]:
+    """Drop duplicate config paths while preserving order."""
+    seen: set[str] = set()
+    unique: List[str] = []
+    for source in sources:
+        resolved = str(Path(source).expanduser().resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique.append(source)
+    return unique
+
+
 def _default_config_chain(model_name: str, preset_default: str | None) -> List[str]:
-    """Return the default stack of config fragments for a model."""
+    """Return the default stack of config fragments for a tuning run.
+
+    Tuning intentionally omits ``configs/base.yaml`` (full-experiment task order
+    and data paths). Use ``configs/tuning_defaults.yaml`` plus the model fragment.
+    """
 
     chain: List[str] = []
-    base_cfg = REPO_ROOT / "configs/base.yaml"
-    if base_cfg.exists():
-        chain.append(str(base_cfg))
-    model_cfg = REPO_ROOT / "configs/models" / f"{model_name}.yaml"
-    if model_cfg.exists():
-        chain.append(str(model_cfg))
-    if not chain and preset_default:
+    tuning_defaults = REPO_ROOT / "configs/tuning_defaults.yaml"
+    if tuning_defaults.exists():
+        chain.append(str(tuning_defaults))
+    model_cfg_candidates = (
+        REPO_ROOT / "configs/models" / f"{model_name}.yaml",
+        REPO_ROOT / "configs/models/til" / f"{model_name}.yaml",
+        REPO_ROOT / "configs/models/cil" / f"{model_name}.yaml",
+    )
+    model_cfg_found = False
+    for model_cfg in model_cfg_candidates:
+        if model_cfg.exists():
+            chain.append(str(model_cfg))
+            model_cfg_found = True
+            break
+    if not model_cfg_found and preset_default:
         preset_path = Path(preset_default)
         if not preset_path.is_absolute():
             preset_path = REPO_ROOT / preset_path
@@ -83,13 +108,13 @@ def build_cli(preset: TuningPreset) -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="FILE",
-        help="Base YAML config file(s) applied in order. Defaults to the shared base"
-        " config plus the model-specific fragment when --config is omitted.",
+        help="YAML config file(s) applied in order. Defaults to tuning_defaults.yaml"
+        " plus the model-specific fragment when --config is omitted.",
     )
     parser.add_argument(
         "--config-dir",
         action="append",
-        default=[str(REPO_ROOT / "configs/tuning_defaults.yaml")],
+        default=[],
         metavar="DIR",
         help="Directory of YAML config fragments to apply (alphabetical order).",
     )
@@ -363,6 +388,53 @@ def extract_final_scores(tensorlike: Any) -> List[float]:
 
 def compute_mean(values: Sequence[float]) -> float:
     return float(sum(values) / len(values)) if values else float("nan")
+
+
+def _trial_rank_key(trial: Dict[str, Any]) -> tuple[float, int, int]:
+    """Sort trials by score, then param completeness, then trial index."""
+    score = trial.get("score")
+    score_value = float(score) if isinstance(score, (int, float)) else float("-inf")
+    params = trial.get("params") or {}
+    return (score_value, len(params), int(trial.get("trial", -1)))
+
+
+def select_best_trial(
+    successes: List[Dict[str, Any]],
+    search_space: Grid,
+    *,
+    hierarchical: bool,
+) -> Dict[str, Any] | None:
+    """Pick the best trial for reporting and YAML writeback.
+
+    For hierarchical sweeps, prefer the final tuning stage so the reported best
+    params include every searched hyperparameter. When scores tie, prefer the
+    trial with the most complete ``params`` mapping and the highest trial index.
+
+    Args:
+        successes: Successful trial result dicts.
+        search_space: Explored hyperparameter grid.
+        hierarchical: Whether the run used ``--hierarchical``.
+
+    Returns:
+        The selected best trial dict, or ``None`` when ``successes`` is empty.
+
+    Usage:
+        best = select_best_trial(results, search_space, hierarchical=True)
+    """
+    if not successes:
+        return None
+    if not hierarchical:
+        return max(successes, key=_trial_rank_key)
+
+    stage_keys = list(search_space.keys())
+    final_stage = stage_keys[-1] if stage_keys else None
+    final_stage_trials = (
+        [trial for trial in successes if trial.get("stage") == final_stage]
+        if final_stage
+        else []
+    )
+    candidate_pool = final_stage_trials or successes
+    return max(candidate_pool, key=_trial_rank_key)
 
 
 def extract_total_f1_mean_from_trial_logs(
@@ -677,6 +749,7 @@ def run_tuning(preset: TuningPreset) -> None:
     config_sources.extend(cli.config)
     if not config_sources:
         config_sources = _default_config_chain(preset.model_name, preset.default_config)
+    config_sources = _dedupe_config_sources(config_sources)
 
     base_args = file_parser.parse_args_from_yaml(config_sources)
     if getattr(base_args, "model", preset.model_name) != preset.model_name:
@@ -838,6 +911,7 @@ def run_tuning(preset: TuningPreset) -> None:
         return stage_results
 
     lr_first_best: Dict[str, Any] | None = None
+    hierarchical_final_params: Dict[str, Any] | None = None
     if cli.hierarchical:
         trial_idx = 0
         stage_overrides: Dict[str, Any] = dict(constant_overrides)
@@ -870,6 +944,9 @@ def run_tuning(preset: TuningPreset) -> None:
                 )
                 break
             stage_overrides[key] = stage_best["trial_params"].get(key)
+        hierarchical_final_params = {
+            key: stage_overrides[key] for key in search_space if key in stage_overrides
+        }
     elif lr_first:
         lr_trials = expand_trials(
             lr_space, cli.num_samples, cli.search_seed, cli.max_trials, cli.shuffle
@@ -901,7 +978,11 @@ def run_tuning(preset: TuningPreset) -> None:
         results.extend(run_trials(trials, constant_overrides, None, 0))
 
     successes = [r for r in results if r.get("status") == "ok"]
-    best = max(successes, key=lambda r: r["score"]) if successes else None
+    best = select_best_trial(
+        successes,
+        full_search_space,
+        hierarchical=bool(cli.hierarchical),
+    )
 
     resolved_chain = [str(Path(path).resolve()) for path in config_sources]
     summary = {
@@ -913,6 +994,7 @@ def run_tuning(preset: TuningPreset) -> None:
         "fixed_overrides": constant_overrides,
         "search_space": full_search_space,
         "hierarchical": bool(cli.hierarchical),
+        "hierarchical_final_params": hierarchical_final_params,
         "lr_first": lr_first,
         "lr_first_keys": lr_keys if lr_first else None,
         "lr_first_best": lr_first_best,
@@ -929,7 +1011,12 @@ def run_tuning(preset: TuningPreset) -> None:
         yaml_update_error: str | None = None
         if cli.config:
             target_yaml = resolve_cli_config_path(cli.config[-1])
-            values_to_write = dict(best.get("trial_params") or {})
+            if hierarchical_final_params:
+                values_to_write = dict(hierarchical_final_params)
+            else:
+                values_to_write = dict(
+                    best.get("params") or best.get("trial_params") or {}
+                )
             if values_to_write:
                 try:
                     updated_yaml_values = write_best_params_to_yaml(
@@ -973,4 +1060,5 @@ __all__ = [
     "build_cli",
     "run_tuning",
     "make_main",
+    "select_best_trial",
 ]

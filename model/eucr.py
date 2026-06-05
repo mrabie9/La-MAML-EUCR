@@ -24,7 +24,11 @@ import torch
 import torch.nn as nn
 
 from model import eucr_consolidation as cons
-from model.detection_replay import noise_label_from_args, signal_mask_exclude_noise, unpack_y_to_class_labels
+from model.detection_replay import (
+    noise_label_from_args,
+    signal_mask_exclude_noise,
+    unpack_y_to_class_labels,
+)
 from model.eucr_backbone import EucrResNet1D
 from model.evidential_modules import EvidentialLoss
 from utils import misc_utils
@@ -70,7 +74,9 @@ class EucrConfig:
 class Net(nn.Module):
     """EUCR continual learner built on an evidential ResNet-1D backbone."""
 
-    def __init__(self, n_inputs: int, n_outputs: int, n_tasks: int, args: object) -> None:
+    def __init__(
+        self, n_inputs: int, n_outputs: int, n_tasks: int, args: object
+    ) -> None:
         super().__init__()
         assert n_tasks > 0, "EUCR requires a positive number of tasks"
 
@@ -110,7 +116,11 @@ class Net(nn.Module):
         self.reg_granularity = str(self.cfg.reg_granularity)
         self.importance_batches = self.cfg.importance_batches
         self.inner_steps = max(1, int(self.cfg.inner_steps))
-        self.clipgrad = float(self.cfg.grad_clip_norm) if self.cfg.grad_clip_norm and self.cfg.grad_clip_norm > 0 else None
+        self.clipgrad = (
+            float(self.cfg.grad_clip_norm)
+            if self.cfg.grad_clip_norm and self.cfg.grad_clip_norm > 0
+            else None
+        )
 
         self.opt = self._build_optimizer()
 
@@ -120,11 +130,26 @@ class Net(nn.Module):
 
     # ------------------------------------------------------------------
     def _build_optimizer(self) -> torch.optim.Optimizer:
-        params = list(self.backbone.parameters())
         lr = float(self.cfg.lr)
         if str(self.cfg.optimizer).lower() == "sgd":
-            return torch.optim.SGD(params, lr=lr, momentum=0.9)
-        return torch.optim.Adam(params, lr=lr)
+            return torch.optim.SGD(self.backbone.parameters(), lr=lr, momentum=0.9)
+        backbone_params: list[nn.Parameter] = []
+        evidential_params: list[nn.Parameter] = []
+        for name, param in self.backbone.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(token in name for token in ("ds_head", "dm_head", "probes")):
+                evidential_params.append(param)
+            else:
+                backbone_params.append(param)
+        return torch.optim.Adam(
+            [
+                {"params": backbone_params, "lr": lr},
+                {"params": evidential_params, "lr": lr * 0.25},
+            ],
+            eps=1e-7,
+            amsgrad=True,
+        )
 
     def _device(self) -> torch.device:
         return next(self.backbone.parameters()).device
@@ -134,7 +159,9 @@ class Net(nn.Module):
         return offset1, min(self.n_outputs, offset2)
 
     # ------------------------------------------------------------------
-    def _mask(self, logits: torch.Tensor, t: int, cil_all_seen_upto_task=None) -> torch.Tensor:
+    def _mask(
+        self, logits: torch.Tensor, t: int, cil_all_seen_upto_task=None
+    ) -> torch.Tensor:
         return misc_utils.apply_task_incremental_logit_mask(
             logits,
             t,
@@ -157,7 +184,9 @@ class Net(nn.Module):
         return self._mask(logits, t, cil_all_seen_upto_task=cil_all_seen_upto_task)
 
     # ------------------------------------------------------------------
-    def observe(self, x: torch.Tensor, y: torch.Tensor, t: int) -> Tuple[float, float, torch.Tensor | None]:
+    def observe(
+        self, x: torch.Tensor, y: torch.Tensor, t: int
+    ) -> Tuple[float, float, torch.Tensor | None]:
         if self.current_task is None:
             self.current_task = t
         elif t != self.current_task:
@@ -170,29 +199,50 @@ class Net(nn.Module):
         loss_value = 0.0
         cls_tr_rec = 0.0
         metric_logits = None
+        device = self._device()
+        amp_device = "cuda" if device.type == "cuda" else "cpu"
 
         for _ in range(self.inner_steps):
-            eu, _features, _omegas, beliefs, probe_outs = self.backbone(
-                x, return_probes=True
-            )
-            head_eu = eu[:, : self.n_outputs].float()
-            head_loss = self.criterion(head_eu, y_cls, beliefs, epoch)
-
-            probe_loss = torch.zeros((), device=head_loss.device)
-            for eu_p, bel_p, _om_p in probe_outs:
-                probe_loss = probe_loss + self.criterion(
-                    eu_p[:, : self.n_outputs].float(), y_cls, bel_p, epoch
+            # Evidential heads use exp/normalise chains that are unstable in AMP.
+            with torch.autocast(device_type=amp_device, enabled=False):
+                eu, _features, _omegas, beliefs, probe_outs = self.backbone(
+                    x, return_probes=True
                 )
-            if probe_outs:
-                probe_loss = probe_loss / len(probe_outs)
+                head_eu = eu[:, : self.n_outputs].float()
+                head_loss = self.criterion(head_eu, y_cls, beliefs, epoch)
 
-            reg = cons.penalty(self.backbone, self.importance, self.theta_star)
-            loss = head_loss + self.probe_loss_weight * probe_loss + self.reg_lambda * reg
+                probe_loss = torch.zeros((), device=head_loss.device)
+                for eu_p, bel_p, _om_p in probe_outs:
+                    probe_loss = probe_loss + self.criterion(
+                        eu_p[:, : self.n_outputs].float(), y_cls, bel_p, epoch
+                    )
+                if probe_outs:
+                    probe_loss = probe_loss / len(probe_outs)
 
-            self.opt.zero_grad()
+                reg = cons.penalty(self.backbone, self.importance, self.theta_star)
+                loss = (
+                    head_loss
+                    + self.probe_loss_weight * probe_loss
+                    + self.reg_lambda * reg
+                )
+
+            if not torch.isfinite(loss).all():
+                print(
+                    "[WARN] EUCR skipping optimizer step: non-finite loss "
+                    f"(task={t}, epoch={epoch})."
+                )
+                with torch.no_grad():
+                    masked = self._mask(head_eu.detach(), t, cil_all_seen_upto_task=t)
+                    metric_logits = masked
+                loss_value = float("nan")
+                break
+
+            self.opt.zero_grad(set_to_none=True)
             loss.backward()
             if self.clipgrad is not None:
-                torch.nn.utils.clip_grad_norm_(self.backbone.parameters(), self.clipgrad)
+                torch.nn.utils.clip_grad_norm_(
+                    self.backbone.parameters(), self.clipgrad
+                )
             self.opt.step()
 
             with torch.no_grad():

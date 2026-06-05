@@ -48,6 +48,14 @@ COMMON_TYPE_HINTS: Dict[str, type] = {
     "clipgrad_norm": float,
     "optimizer": str,
     "smax": float,
+    "reg_lambda": float,
+    "probe_loss_weight": float,
+    "nu": float,
+    "importance_batches": int,
+    "grad_clip_norm": float,
+    "eucr_depth": int,
+    "kl_warmup_epochs": int,
+    "proto_factor": int,
 }
 
 
@@ -711,6 +719,47 @@ TUNING_PRESETS: Dict[str, TuningPreset] = {
                     "min": 0.01,
                     "fallback": 0.1,
                     "values": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
+                },
+            }
+        ),
+    ),
+    "eucr": TuningPreset(
+        model_name="eucr",
+        description="Run grid or random search over EUCR hyperparameters.",
+        default_config="configs/models/til/eucr.yaml",
+        default_output_root="logs/tuning/eucr",
+        type_hints=COMMON_TYPE_HINTS,
+        grid_factory=make_grid_factory(
+            {
+                "lr": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 1e-5,
+                    "fallback": 1e-3,
+                    "values": [
+                        0.03,
+                        0.01,
+                        0.003,
+                        0.001,
+                        0.0003,
+                        0.0001,
+                        0.00003,
+                        0.00001,
+                    ],
+                },
+                "reg_lambda": {
+                    "kind": "float",
+                    "factors": (0.3, 1.0, 3.0),
+                    "min": 1e-2,
+                    "fallback": 1000.0,
+                    "values": [1, 10, 100, 1000, 10000],
+                },
+                "probe_loss_weight": {
+                    "kind": "float",
+                    "factors": (0.5, 1.0, 2.0),
+                    "min": 0.05,
+                    "fallback": 0.5,
+                    "values": [0.1, 0.25, 0.5, 1.0],
                 },
             }
         ),

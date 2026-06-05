@@ -112,3 +112,70 @@ def test_run_tuning_records_yaml_error_without_failing(
         summary.get("updated_yaml_error") == "write failed"
         for summary in captured_summaries
     )
+
+
+def test_select_best_trial_prefers_final_hierarchical_stage() -> None:
+    """Hierarchical sweeps should not report an early-stage trial as best."""
+    search_space = {
+        "lr": [0.01, 0.001],
+        "reg_lambda": [10, 100],
+    }
+    successes = [
+        {
+            "trial": 1,
+            "stage": "lr",
+            "score": 0.2,
+            "params": {"lr": 0.001},
+            "trial_params": {"lr": 0.001},
+        },
+        {
+            "trial": 3,
+            "stage": "reg_lambda",
+            "score": 0.2,
+            "params": {"lr": 0.001, "reg_lambda": 100},
+            "trial_params": {"reg_lambda": 100},
+            "fixed_params": {"lr": 0.001},
+        },
+    ]
+    best = hyperparam_tuner.select_best_trial(
+        successes, search_space, hierarchical=True
+    )
+    assert best is not None
+    assert best["trial"] == 3
+    assert best["params"]["reg_lambda"] == 100
+
+
+def test_dedupe_config_sources_preserves_first_occurrence() -> None:
+    """Duplicate --config paths should not be applied twice."""
+    first = str(ROOT / "configs/tuning_defaults.yaml")
+    second = str((ROOT / "configs/tuning_defaults.yaml").resolve())
+    deduped = hyperparam_tuner._dedupe_config_sources([first, second])
+    assert len(deduped) == 1
+
+
+def test_default_config_chain_omits_base_yaml() -> None:
+    """Tuning defaults must not pull in full-experiment base.yaml."""
+    chain = hyperparam_tuner._default_config_chain("eucr", None)
+    names = [Path(path).name for path in chain]
+    assert "base.yaml" not in names
+    assert "tuning_defaults.yaml" in names
+    assert "eucr.yaml" in names
+
+
+def test_select_best_trial_breaks_score_ties_by_param_completeness() -> None:
+    """Equal scores should prefer trials with the full searched parameter set."""
+    search_space = {"lr": [0.001], "reg_lambda": [100]}
+    successes = [
+        {"trial": 3, "stage": "lr", "score": 0.1, "params": {"lr": 0.001}},
+        {
+            "trial": 16,
+            "stage": "reg_lambda",
+            "score": 0.1,
+            "params": {"lr": 0.001, "reg_lambda": 100, "probe_loss_weight": 1.0},
+        },
+    ]
+    best = hyperparam_tuner.select_best_trial(
+        successes, search_space, hierarchical=True
+    )
+    assert best is not None
+    assert best["trial"] == 16

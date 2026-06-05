@@ -854,6 +854,8 @@ def life_experience(model, inc_loader, args):
         else torch.float16
     )
     use_amp = bool(getattr(args, "amp", False) and args.cuda)
+    if getattr(args, "model", "") == "eucr":
+        use_amp = False
     log_state(
         args.state_logging,
         "Life experience start: {} tasks queued".format(inc_loader.n_tasks),
