@@ -1,0 +1,23 @@
+# Model-specific overrides for EUCR (Evidential Uncertainty Channel Regularisation).
+model: eucr
+loader: class_incremental_loader
+
+# Optimiser (Adam required for evidential heads; AMP disabled — see main.py)
+optimizer: adam
+amp: false
+lr: 0.0003
+inner_steps: 1
+grad_clip_norm: 5.0
+
+# Evidential consolidation
+reg_lambda: 1000.0
+reg_granularity: channel
+importance_batches: 20
+
+# Evidential backbone / probes
+probe_stages: "1,2,3,4"
+probe_loss_weight: 0.5
+nu: 0.9
+proto_factor: 20
+kl_warmup_epochs: 35
+eucr_depth: 18
